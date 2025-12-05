@@ -1266,8 +1266,18 @@ impl SubProof {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AggregatedProof {
-    pub(crate) c_hash: BigNumber,
-    pub(crate) c_list: Vec<Vec<u8>>,
+    pub c_hash: BigNumber,
+    pub c_list: Vec<Vec<u8>>,
+}
+
+impl AggregatedProof {
+    pub fn c_hash_cloned(&self) -> BigNumber {
+        self.c_hash.clone()
+    }
+
+    pub fn c_list_cloned(&self) -> Vec<Vec<u8>> {
+        self.c_list.clone()
+    }
 }
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
