@@ -9,6 +9,8 @@ use crate::hash::hash_list_to_bignum;
 use crate::helpers::*;
 use crate::types::*;
 
+use hex;
+
 /// Party that wants to check that prover has some credentials provided by issuer.
 #[derive(Copy, Clone, Debug)]
 pub struct Verifier;
@@ -229,15 +231,29 @@ impl ProofVerifier {
     /// assert!(proof_verifier.verify(&proof, &proof_request_nonce).unwrap());
     /// ```
     pub fn verify(&mut self, proof: &Proof, nonce: &Nonce) -> ClResult<bool> {
-        trace!("ProofVerifier::verify: >>> proof: {proof:?}, nonce: {nonce:?}");
+        trace!(
+            "ProofVerifier::verify: BEGIN >>> proof {:?}, nonce {:?}",
+            proof,
+            nonce
+        );
 
+        debug!("Checking parameter consistency...");
         ProofVerifier::_check_verify_params_consistency(&self.credentials, proof)?;
+        debug!("Parameter consistency OK");
 
         let mut tau_list: Vec<Vec<u8>> = Vec::new();
 
+        debug!("Iterating over {} subproofs…", proof.proofs.len());
+
         for idx in 0..proof.proofs.len() {
+            debug!("--- SubProof [{}] ---", idx);
+
             let proof_item = &proof.proofs[idx];
             let credential = &self.credentials[idx];
+
+            trace!("SubProof [{}] -> proof_item.primary_proof = {:?}", idx, proof_item.primary_proof);
+            trace!("SubProof [{}] -> credential.pub_key = {:?}", idx, credential.pub_key);
+
             if let (
                 Some(non_revocation_proof),
                 Some(cred_rev_pub_key),
@@ -249,6 +265,8 @@ impl ProofVerifier {
                 credential.rev_reg.as_ref(),
                 credential.rev_key_pub.as_ref(),
             ) {
+                debug!("SubProof [{}] -> non-revocation proof found", idx);
+
                 let sub_tau_list = ProofVerifier::_verify_non_revocation_proof(
                     cred_rev_pub_key,
                     rev_reg,
@@ -258,41 +276,69 @@ impl ProofVerifier {
                     non_revocation_proof,
                     self.accept_legacy_revocation,
                 )?;
-                tau_list.extend_from_slice(&sub_tau_list.as_slice()?);
-            };
 
-            // Check that `m_hat`s of all common attributes are same. Also `m_hat` for each common attribute must be present in each sub proof
+                debug!(
+                    "SubProof [{}] -> _verify_non_revocation_proof returned {} tau items",
+                    idx,
+                    sub_tau_list.as_slice()?.len()
+                );
+
+                tau_list.extend_from_slice(&sub_tau_list.as_slice()?);
+            } else {
+                debug!(
+                    "SubProof [{}] -> no non-revocation proof available, skipping NR validation",
+                    idx
+                );
+            }
+
+            // ============= CHECK COMMON ATTRIBUTES =============
+            debug!("SubProof [{}] -> checking common attributes", idx);
+
             let attr_names: Vec<String> = self
                 .common_attributes
                 .keys()
                 .map(|s| s.to_string())
                 .collect();
+
             for attr_name in attr_names {
+                debug!("Checking common attribute: {}", attr_name);
+
                 if proof_item.primary_proof.eq_proof.m.contains_key(&attr_name) {
                     let m_hat = &proof_item.primary_proof.eq_proof.m[&attr_name];
+                    trace!("Found m_hat = {:?}", m_hat);
+
                     match self.common_attributes.entry(attr_name.clone()) {
                         Entry::Occupied(mut entry) => {
                             let x = entry.get_mut();
                             match x {
                                 Some(v) => {
                                     if v != m_hat {
+                                        error!(
+                                            "Mismatch in m_hat for common attribute '{}'",
+                                            attr_name
+                                        );
                                         return Err(err_msg!(
                                             ProofRejected,
-                                            "Blinded value for common attribute '{}' different across sub proofs", attr_name,
+                                            "Blinded value for common attribute '{}' different across sub proofs",
+                                            attr_name,
                                         ));
+                                    } else {
+                                        debug!("Common attribute '{}' m_hat matches previous subproof", attr_name);
                                     }
                                 }
-                                // For first subproof
                                 None => {
+                                    debug!("First occurrence of '{}' -> storing m_hat", attr_name);
                                     *x = Some(m_hat.try_clone()?);
                                 }
                             }
                         }
-                        // Vacant is not possible because `attr_names` is constructed from keys of `self.common_attributes`
-                        Entry::Vacant(_) => (),
+                        Entry::Vacant(_) => {
+                            // Should not happen
+                            error!("Unexpected Vacant entry for attribute '{}'", attr_name);
+                        }
                     }
                 } else {
-                    // `m_hat` for common attribute not present in sub proof
+                    error!("m_hat for '{}' not found in sub proof", attr_name);
                     return Err(err_msg!(
                         ProofRejected,
                         "Blinded value for common attribute '{}' not found in proof.m",
@@ -300,28 +346,62 @@ impl ProofVerifier {
                     ));
                 }
             }
-            tau_list.append_vec(&ProofVerifier::_verify_primary_proof(
+
+            // ============= VERIFY PRIMARY PROOF =============
+            debug!("SubProof [{}] -> verifying primary proof...", idx);
+
+            let primary_tau = ProofVerifier::_verify_primary_proof(
                 &credential.pub_key.p_key,
                 &proof.aggregated_proof.c_hash,
                 &proof_item.primary_proof,
                 &credential.credential_schema,
                 &credential.non_credential_schema,
                 &credential.sub_proof_request,
-            )?)?;
+            )?;
+
+            debug!(
+                "SubProof [{}] -> primary proof returned {} tau items",
+                idx,
+                primary_tau.len()
+            );
+
+            tau_list.append_vec(&primary_tau)?;
         }
+
+        // ============================================================
+        // PRINT ALL VALUES GOING INTO HASH
+        // ============================================================
 
         let mut values: Vec<Vec<u8>> = Vec::new();
         values.extend_from_slice(&tau_list);
         values.extend_from_slice(&proof.aggregated_proof.c_list);
         values.push(nonce.to_bytes()?);
 
+        error!("======= VALUES GOING INTO c_hash ({} itens) =======", values.len());
+
+        for (i, v) in values.iter().enumerate() {
+            error!(
+                "values[{}] = len {} bytes | hex = {}",
+                i,
+                v.len(),
+                hex::encode(v)
+            );
+        }
+
+        trace!("Computing c_hver...");
         let c_hver = hash_list_to_bignum(&values)?;
+        trace!("Computed c_hver = {:?}", c_hver);
 
         info!(target: "anoncreds_service", "Verifier verify proof -> done");
 
         let valid = c_hver == proof.aggregated_proof.c_hash;
 
-        trace!("ProofVerifier::verify: <<< valid: {:?}", valid);
+        info!(
+            "Proof verification result = {}",
+            if valid { "VALID" } else { "INVALID" }
+        );
+
+        trace!("ProofVerifier::verify: <<< END, valid={:?}", valid);
 
         Ok(valid)
     }
